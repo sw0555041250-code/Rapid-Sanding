@@ -55,4 +55,5 @@ jobs:
 
       - name: Show compile errors
         if: failure()
-        run: grep -E "^e: |error:|What went wrong" -A3 build.log | head -80 || true
+        run: |
+          grep -E "^e: |error:|What went wrong" -A3 build.log | head -80 || true
