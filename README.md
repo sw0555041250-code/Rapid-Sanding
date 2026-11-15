@@ -8,7 +8,7 @@
 
 ## ⬇️ הורדה
 
-**[להורדת QuickReceive.apk מהגרסה האחרונה](../../releases/latest/download/QuickReceive.apk)**
+**[להורדת QuickReceive.apk מהגרסה האחרונה](https://github.com/sw0555041250-code/Rapid-Sanding/releases/latest/download/QuickReceive.apk)**
 
 ## למה צריך את זה?
 
