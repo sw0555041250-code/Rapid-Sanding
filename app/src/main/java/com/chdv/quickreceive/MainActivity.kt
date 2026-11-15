@@ -224,6 +224,8 @@ class MainActivity : BaseActivity() {
         card.addView(divider())
         card.addView(clickRow("פעולה ברקע", "בלי הגבלת סוללה – כדי לקבל גם כשהמסך כבוי") { askBattery() })
         card.addView(divider())
+        card.addView(clickRow("בדיקת תקינות", "לא רואים אותי? כאן רואים מה לא עובד, ומעתיקים דוח") { startActivity(Intent(this, DiagActivity::class.java)) })
+        card.addView(divider())
         card.addView(clickRow("בדיקת עדכונים", "גרסה ${Updater.version(this)}") { Updater.check(this, silent = false) })
         card.addView(divider())
         card.addView(toggleRow("עדכון אוטומטי", "בודק פעם ביום ומציע להתקין גרסה חדשה", Updater.autoEnabled(this)) { Updater.setAuto(this, it) })

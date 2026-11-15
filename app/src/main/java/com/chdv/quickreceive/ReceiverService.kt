@@ -1,6 +1,12 @@
 package com.chdv.quickreceive
 
 import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
+import android.content.pm.PackageManager
 import android.app.Notification
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -29,11 +35,29 @@ import kotlin.concurrent.thread
 
 /** Shared state between the service and the screens (same process). */
 object Live {
-    /** our 4-character id on the network, the same for receiving and sending */
-    val endpointId: String = run {
+    private fun randomId(): String {
         val abc = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        (1..4).map { abc[Crypto.random.nextInt(abc.length)] }.joinToString("")
+        return (1..4).map { abc[Crypto.random.nextInt(abc.length)] }.joinToString("")
     }
+
+    /** our 4-character id on the network, the same for receiving and sending */
+    @Volatile var endpointId: String = randomId()
+        private set
+    fun newEndpointId() { endpointId = randomId() }
+
+    @Volatile var registeredName = ""
+    @Volatile var port = 0
+    @Volatile var multicast = false
+    @Volatile var bleScan = "כבוי"
+    @Volatile var lastPhoneNearby = 0L
+
+    private val logLines = ArrayDeque<String>()
+    fun log(msg: String) {
+        android.util.Log.i("QuickShare", msg)
+        val t = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())
+        synchronized(logLines) { logLines.addLast("$t  $msg"); while (logLines.size > 120) logLines.removeFirst() }
+    }
+    fun logText(): String = synchronized(logLines) { logLines.joinToString("\n") }
     /** the "ready to receive" screen is open: visible to everyone meanwhile */
     @Volatile var receiveScreen = false
     @Volatile var running = false
@@ -58,6 +82,7 @@ class ReceiverService : Service(), Events {
     private val main = Handler(Looper.getMainLooper())
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
+    private var multicastLock: WifiManager.MulticastLock? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -66,8 +91,10 @@ class ReceiverService : Service(), Events {
     override fun onCreate() {
         super.onCreate()
         startForeground(NOTIF_STATUS, statusNotification("מתחיל…"))
+        holdMulticast()
         startServer()
         watchNetwork()
+        startBeaconScan()
         checkVisibility()
     }
 
@@ -90,7 +117,7 @@ class ReceiverService : Service(), Events {
             ACTION_ACCEPT -> accept(id)
             ACTION_REJECT -> reject(id)
             ACTION_CANCEL -> connections[id]?.cancel()
-            ACTION_REFRESH -> { unregisterNsd(); registerNsd(); checkVisibility() }
+            ACTION_REFRESH -> { announce(intent.getStringExtra("why") ?: "רענון"); startBeaconScan(); checkVisibility() }
             ACTION_STOP -> {
                 Prefs(this).visibility = "off"
                 Live.changed()
@@ -104,6 +131,8 @@ class ReceiverService : Service(), Events {
         Live.running = false
         Live.changed()
         unregisterNsd()
+        stopBeaconScan()
+        releaseMulticast()
         netCallback?.let { runCatching { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) } }
         runCatching { server?.close() }
         connections.values.forEach { it.cancel() }
@@ -117,9 +146,11 @@ class ReceiverService : Service(), Events {
         try {
             val s = ServerSocket(0)
             server = s
+            Live.port = s.localPort
             thread(name = "qs-accept") {
                 while (!s.isClosed) {
                     val sock = try { s.accept() } catch (e: Exception) { break }
+                    Live.log("חיבור נכנס מ-${sock.inetAddress?.hostAddress}")
                     val conn = InboundConnection(sock, storageFor(this), this)
                     connections[conn.id] = conn
                     holdLocks()
@@ -138,60 +169,189 @@ class ReceiverService : Service(), Events {
         }
     }
 
-    private fun registerNsd() {
-        val port = server?.localPort ?: return
-        val name = Prefs(this).deviceName
-        // Service name: 0x23, 4-byte endpoint id, service id hash FC 9F 5E, two zero bytes
+    // ---------- mDNS announcement: exactly one registration at a time ----------
+    // Re-registering while the previous registration is still alive makes Android rename the
+    // service ("name (2)"), and then phones can't recognize it. So: a small state machine.
+
+    private enum class NsdState { IDLE, REGISTERING, REGISTERED, UNREGISTERING }
+    private var nsdState = NsdState.IDLE
+    private var nsdAgain = false
+    private var nsdWanted = false
+
+    private fun expectedServiceName(): String {
+        // 0x23, 4-byte endpoint id, service id hash FC 9F 5E, two zero bytes
         val nameBytes = byteArrayOf(0x23) + Live.endpointId.toByteArray(Charsets.US_ASCII) +
             byteArrayOf(0xFC.toByte(), 0x9F.toByte(), 0x5E, 0, 0)
+        return b64(nameBytes)
+    }
+
+    /** Make sure we are announced, freshly (phones that started looking earlier may have missed us). */
+    private fun announce(reason: String) {
+        nsdWanted = true
+        Live.log("הכרזה ברשת ($reason)")
+        when (nsdState) {
+            NsdState.IDLE -> doRegister()
+            NsdState.REGISTERED -> { nsdAgain = true; doUnregister() }
+            NsdState.REGISTERING -> {}   // a fresh announcement is already on its way
+            NsdState.UNREGISTERING -> nsdAgain = true
+        }
+    }
+
+    private fun registerNsd() = announce("הפעלה")
+
+    private fun unregisterNsd() {
+        nsdWanted = false; nsdAgain = false
+        if (nsdState == NsdState.REGISTERED || nsdState == NsdState.REGISTERING) doUnregister()
+        Live.running = false
+    }
+
+    private fun doRegister() {
+        val port = server?.localPort ?: return
+        val name = Prefs(this).deviceName
+        val expected = expectedServiceName()
         val info = NsdServiceInfo().apply {
-            serviceName = b64(nameBytes)
+            serviceName = expected
             serviceType = SERVICE_TYPE
             setPort(port)
             setAttribute("n", b64(endpointInfo(name)))
         }
         val listener = object : NsdManager.RegistrationListener {
-            override fun onServiceRegistered(si: NsdServiceInfo) {
+            override fun onServiceRegistered(si: NsdServiceInfo) = main.post {
+                nsdState = NsdState.REGISTERED
+                Live.registeredName = si.serviceName
+                if (si.serviceName != expected) {
+                    // renamed because of a conflict: pick a new id and announce again
+                    Live.log("השם ברשת שונה ל-\"${si.serviceName}\" – מחליף מזהה ומכריז מחדש")
+                    Live.newEndpointId()
+                    nsdAgain = true; doUnregister(); return@post
+                }
+                Live.log("רשום ברשת: ${si.serviceName}, פורט $port")
                 Live.running = true; Live.visibleAs = name; Live.error = null
+                if (nsdAgain || !nsdWanted) { doUnregister() }
                 updateStatus(); Live.changed()
-            }
-            override fun onRegistrationFailed(si: NsdServiceInfo, code: Int) {
+            }.let {}
+            override fun onRegistrationFailed(si: NsdServiceInfo, code: Int) = main.post {
+                nsdState = NsdState.IDLE
                 Live.error = "הרישום ברשת נכשל (קוד $code)"
+                Live.log("רישום ברשת נכשל, קוד $code")
                 updateStatus(); Live.changed()
-            }
-            override fun onServiceUnregistered(si: NsdServiceInfo) {}
-            override fun onUnregistrationFailed(si: NsdServiceInfo, code: Int) {}
+                if (nsdWanted) main.postDelayed({ if (nsdWanted && nsdState == NsdState.IDLE) doRegister() }, 5000)
+            }.let {}
+            override fun onServiceUnregistered(si: NsdServiceInfo) = main.post {
+                nsdState = NsdState.IDLE
+                Live.running = false
+                if (nsdWanted && nsdAgain) { nsdAgain = false; doRegister() }
+            }.let {}
+            override fun onUnregistrationFailed(si: NsdServiceInfo, code: Int) = main.post {
+                nsdState = NsdState.IDLE
+                Live.log("ביטול רישום נכשל, קוד $code")
+                if (nsdWanted && nsdAgain) { nsdAgain = false; Live.newEndpointId(); doRegister() }
+            }.let {}
         }
         val m = getSystemService(NsdManager::class.java)
         nsd = m
         registration = listener
+        nsdState = NsdState.REGISTERING
         try { m.registerService(info, NsdManager.PROTOCOL_DNS_SD, listener) } catch (e: Exception) {
-            Live.error = "הרישום ברשת נכשל: ${e.message}"; Live.changed()
+            nsdState = NsdState.IDLE
+            Live.error = "הרישום ברשת נכשל: ${e.message}"; Live.log("רישום נכשל: $e"); Live.changed()
         }
     }
 
-    private fun unregisterNsd() {
-        val l = registration ?: return
-        registration = null
-        runCatching { nsd?.unregisterService(l) }
-        Live.running = false
+    private fun doUnregister() {
+        val l = registration ?: run { nsdState = NsdState.IDLE; return }
+        nsdState = NsdState.UNREGISTERING
+        try { nsd?.unregisterService(l) } catch (e: Exception) {
+            nsdState = NsdState.IDLE
+            if (nsdWanted && nsdAgain) { nsdAgain = false; doRegister() }
+        }
     }
 
-    /** When Wi-Fi comes back (or changes), announce ourselves again. */
+    private var lastNetwork: Network? = null
+
+    /** When Wi-Fi changes (not on the first callback, which just reports the current network), announce again. */
     private fun watchNetwork() {
         val cm = getSystemService(ConnectivityManager::class.java)
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                main.postDelayed({ unregisterNsd(); registerNsd() }, 1500)
+                main.post {
+                    val prev = lastNetwork
+                    lastNetwork = network
+                    Live.error = null
+                    if (prev != null && prev != network) main.postDelayed({ announce("רשת חדשה") }, 1500)
+                    else if (prev == null && nsdState == NsdState.IDLE && nsdWanted) announce("רשת זמינה")
+                    updateStatus(); Live.changed()
+                }
             }
             override fun onLost(network: Network) {
-                main.post { Live.running = false; Live.error = "אין חיבור ל-Wi-Fi"; updateStatus(); Live.changed() }
+                main.post {
+                    if (network == lastNetwork) {
+                        lastNetwork = null
+                        Live.running = false; Live.error = "אין חיבור ל-Wi-Fi"; Live.log("Wi-Fi התנתק")
+                        updateStatus(); Live.changed()
+                    }
+                }
             }
         }
         netCallback = cb
         runCatching {
             cm.registerNetworkCallback(NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build(), cb)
         }
+    }
+
+    /** Without this, many devices drop the network's "who is here?" questions while saving power. */
+    private fun holdMulticast() {
+        if (multicastLock?.isHeld == true) return
+        multicastLock = runCatching {
+            applicationContext.getSystemService(WifiManager::class.java).createMulticastLock("quickshare:mdns").apply {
+                setReferenceCounted(false); acquire()
+            }
+        }.getOrNull()
+        Live.multicast = multicastLock?.isHeld == true
+    }
+
+    private fun releaseMulticast() {
+        runCatching { multicastLock?.let { if (it.isHeld) it.release() } }
+        multicastLock = null
+        Live.multicast = false
+    }
+
+    // ---------- phones that start sharing nearby (Bluetooth) → announce again ----------
+
+    private var scanCallback: ScanCallback? = null
+    private var lastBeacon = 0L
+
+    @SuppressLint("MissingPermission")
+    private fun startBeaconScan() {
+        if (scanCallback != null) return
+        if (checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) { Live.bleScan = "אין הרשאת מיקום"; return }
+        val adapter = BluetoothAdapter.getDefaultAdapter()
+        val scanner = adapter?.takeIf { it.isEnabled }?.bluetoothLeScanner ?: run { Live.bleScan = "Bluetooth כבוי"; return }
+        val cb = object : ScanCallback() {
+            override fun onScanResult(callbackType: Int, result: ScanResult) {
+                val now = System.currentTimeMillis()
+                if (now - lastBeacon < 15_000) return
+                lastBeacon = now
+                main.post {
+                    Live.lastPhoneNearby = now
+                    Live.log("טלפון בסביבה פתח שיתוף (${result.device?.address ?: "?"})")
+                    if (connections.isEmpty()) announce("טלפון בסביבה משתף")
+                    Live.changed()
+                }
+            }
+            override fun onScanFailed(errorCode: Int) { Live.bleScan = "הסריקה נכשלה ($errorCode)" }
+        }
+        val filter = ScanFilter.Builder().setServiceData(Discovery.SHARING_UUID, ByteArray(0), ByteArray(0)).build()
+        val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_POWER).build()
+        runCatching { scanner.startScan(listOf(filter), settings, cb); scanCallback = cb; Live.bleScan = "פעיל" }
+            .onFailure { Live.bleScan = "לא זמין: ${it.message}" }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun stopBeaconScan() {
+        val cb = scanCallback ?: return
+        scanCallback = null
+        runCatching { BluetoothAdapter.getDefaultAdapter()?.bluetoothLeScanner?.stopScan(cb) }
     }
 
     @SuppressLint("WakelockTimeout")
@@ -313,7 +473,7 @@ class ReceiverService : Service(), Events {
         nm.notify(NOTIF_DONE + conn.id, n)
     }
 
-    override fun log(msg: String) { Log.i("QuickReceive", msg) }
+    override fun log(msg: String) { Live.log(msg) }
 
     private fun accept(id: Int) {
         val (conn, info) = Live.pending[id] ?: return
@@ -378,8 +538,8 @@ class ReceiverService : Service(), Events {
         fun stop(ctx: Context) = ctx.stopService(Intent(ctx, ReceiverService::class.java))
 
         /** Start or stop receiving according to the visibility setting. */
-        fun refresh(ctx: Context) {
-            if (Prefs(ctx).visible) start(ctx, ACTION_REFRESH) else stop(ctx)
+        fun refresh(ctx: Context, why: String = "רענון") {
+            if (Prefs(ctx).visible) ctx.startForegroundService(Intent(ctx, ReceiverService::class.java).setAction(ACTION_REFRESH).putExtra("why", why)) else stop(ctx)
             Live.changed()
         }
 

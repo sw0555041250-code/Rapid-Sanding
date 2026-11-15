@@ -31,17 +31,28 @@ class Discovery(private val ctx: Context, private val ownEndpointId: String, pri
     private var resolving = false
     private var listener: NsdManager.DiscoveryListener? = null
     private var advertiseCallback: AdvertiseCallback? = null
+    var bleError = 0
+        private set
     var bleState: String = "off"   // "on", "off" (Bluetooth is off), "unsupported", "failed"
         private set
 
+    private var multicast: android.net.wifi.WifiManager.MulticastLock? = null
+
     fun start() {
+        multicast = runCatching {
+            ctx.applicationContext.getSystemService(android.net.wifi.WifiManager::class.java)
+                .createMulticastLock("quickshare:discovery").apply { setReferenceCounted(false); acquire() }
+        }.getOrNull()
+        Live.log("מחפש מכשירים (multicast ${if (multicast?.isHeld == true) "פעיל" else "לא פעיל"})")
         val l = object : NsdManager.DiscoveryListener {
             override fun onDiscoveryStarted(serviceType: String) {}
             override fun onDiscoveryStopped(serviceType: String) {}
-            override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) { Log.w(TAG, "discovery failed $errorCode") }
+            override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) { Live.log("חיפוש ברשת נכשל, קוד $errorCode") }
             override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {}
             override fun onServiceFound(info: NsdServiceInfo) {
-                val id = endpointIdOf(info.serviceName) ?: return
+                val id = endpointIdOf(info.serviceName)
+                Live.log("נמצא ברשת: ${info.serviceName}${if (id == null) " (שם לא תקין)" else if (id == ownEndpointId) " (אני)" else ""}")
+                if (id == null) return
                 if (id == ownEndpointId) return
                 main.post { queue.add(info); next() }
             }
@@ -60,6 +71,8 @@ class Discovery(private val ctx: Context, private val ownEndpointId: String, pri
         listener?.let { runCatching { nsd.stopServiceDiscovery(it) } }
         listener = null
         stopBeacon()
+        runCatching { multicast?.let { if (it.isHeld) it.release() } }
+        multicast = null
         main.removeCallbacksAndMessages(null)
     }
 
@@ -92,11 +105,12 @@ class Discovery(private val ctx: Context, private val ownEndpointId: String, pri
     private fun add(si: NsdServiceInfo) {
         val id = endpointIdOf(si.serviceName) ?: return
         val host = si.host ?: return
-        val raw = si.attributes["n"] ?: return
+        val raw = si.attributes["n"] ?: run { Live.log("${si.serviceName}: חסר מידע על המכשיר"); return }
         val info = runCatching { Base64.decode(String(raw, Charsets.US_ASCII), Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP) }.getOrNull() ?: return
         if (info.size < 18) return
         val visibleName = info[0].toInt() and 0x10 == 0
         if (!visibleName) {
+            Live.log("${si.serviceName}: גלוי רק לאנשי קשר")
             // shown only to the owner's contacts: we can't see its name or connect
             hidden.add(si.serviceName); publish(); return
         }
@@ -104,6 +118,7 @@ class Discovery(private val ctx: Context, private val ownEndpointId: String, pri
         if (info.size < 18 + len) return
         val name = String(info, 18, len, Charsets.UTF_8)
         peers[si.serviceName] = Peer(si.serviceName, id, name, (info[0].toInt() shr 1) and 7, host, si.port)
+        Live.log("מכשיר זמין: $name (${host.hostAddress}:${si.port})")
         publish()
     }
 
@@ -114,10 +129,10 @@ class Discovery(private val ctx: Context, private val ownEndpointId: String, pri
     @SuppressLint("MissingPermission")
     private fun startBeacon() {
         val adapter = BluetoothAdapter.getDefaultAdapter()
-        if (adapter == null) { bleState = "unsupported"; return }
-        if (!adapter.isEnabled) { bleState = "off"; return }
+        if (adapter == null) { bleState = "unsupported"; Live.log("אין Bluetooth"); return }
+        if (!adapter.isEnabled) { bleState = "off"; Live.log("Bluetooth כבוי"); return }
         val adv = adapter.bluetoothLeAdvertiser
-        if (adv == null) { bleState = "unsupported"; return }
+        if (adv == null || !adapter.isMultipleAdvertisementSupported) { bleState = "unsupported"; Live.log("המכשיר לא תומך בשידור Bluetooth LE"); return }
         val data = AdvertiseData.Builder()
             .setIncludeDeviceName(false)
             .setIncludeTxPowerLevel(false)
@@ -130,8 +145,8 @@ class Discovery(private val ctx: Context, private val ownEndpointId: String, pri
             .setTimeout(0)
             .build()
         val cb = object : AdvertiseCallback() {
-            override fun onStartSuccess(settingsInEffect: AdvertiseSettings) { bleState = "on"; publish() }
-            override fun onStartFailure(errorCode: Int) { bleState = "failed"; Log.w(TAG, "BLE advertise failed $errorCode"); publish() }
+            override fun onStartSuccess(settingsInEffect: AdvertiseSettings) { bleState = "on"; Live.log("משדר אות Bluetooth לטלפונים"); publish() }
+            override fun onStartFailure(errorCode: Int) { bleState = "failed"; bleError = errorCode; Live.log("שידור Bluetooth נכשל, קוד $errorCode"); publish() }
         }
         advertiseCallback = cb
         runCatching { adv.startAdvertising(settings, data, cb) }.onFailure { bleState = "failed" }

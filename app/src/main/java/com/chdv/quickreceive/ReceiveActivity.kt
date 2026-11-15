@@ -14,7 +14,7 @@ class ReceiveActivity : BaseActivity() {
         super.onResume()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         Live.receiveScreen = true
-        ReceiverService.refresh(this)
+        ReceiverService.refresh(this, "מסך קבלה")
         Live.listen(refresh)
         render()
     }

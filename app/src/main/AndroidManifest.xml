@@ -16,6 +16,9 @@
     <uses-permission android:name="android.permission.BLUETOOTH" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+    <!-- Android needs "location" to receive Bluetooth LE signals (to notice phones that start sharing) -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
     <application
         android:name=".App"
@@ -54,6 +57,7 @@
         </activity>
 
         <activity android:name=".ReceiveActivity" android:exported="false" />
+        <activity android:name=".DiagActivity" android:exported="false" />
 
         <activity
             android:name=".ConsentActivity"
