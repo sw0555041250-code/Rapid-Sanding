@@ -30,6 +30,7 @@ class MainActivity : BaseActivity() {
         super.onResume()
         Live.listen(refresh)
         render()
+        Updater.dailyCheck(this)
     }
 
     override fun onPause() {
@@ -222,6 +223,10 @@ class MainActivity : BaseActivity() {
         card.addView(toggleRow("להתחיל עם הדלקת המכשיר", "כשמוגדר \"כולם\"", prefs.startOnBoot) { prefs.startOnBoot = it })
         card.addView(divider())
         card.addView(clickRow("פעולה ברקע", "בלי הגבלת סוללה – כדי לקבל גם כשהמסך כבוי") { askBattery() })
+        card.addView(divider())
+        card.addView(clickRow("בדיקת עדכונים", "גרסה ${Updater.version(this)}") { Updater.check(this, silent = false) })
+        card.addView(divider())
+        card.addView(toggleRow("עדכון אוטומטי", "בודק פעם ביום ומציע להתקין גרסה חדשה", Updater.autoEnabled(this)) { Updater.setAuto(this, it) })
         return card
     }
 
