@@ -11,10 +11,14 @@
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Bluetooth: the "someone nearby is sharing" signal that makes phones appear -->
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
 
     <application
         android:name=".App"
-        android:label="קבלה מהירה"
+        android:label="שיתוף מהיר"
         android:icon="@mipmap/ic_launcher"
         android:supportsRtl="true"
         android:allowBackup="true"
@@ -31,6 +35,26 @@
         </activity>
 
         <activity
+            android:name=".SendActivity"
+            android:exported="true"
+            android:label="שיתוף מהיר"
+            android:launchMode="singleTop"
+            android:taskAffinity=".send">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+        </activity>
+
+        <activity android:name=".ReceiveActivity" android:exported="false" />
+
+        <activity
             android:name=".ConsentActivity"
             android:exported="false"
             android:launchMode="singleTop"
@@ -40,6 +64,21 @@
         <service
             android:name=".ReceiverService"
             android:exported="false" />
+
+        <service
+            android:name=".SendService"
+            android:exported="false" />
+
+        <service
+            android:name=".VisibilityTile"
+            android:exported="true"
+            android:icon="@drawable/ic_stat"
+            android:label="שיתוף מהיר"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
 
         <receiver
             android:name=".BootReceiver"

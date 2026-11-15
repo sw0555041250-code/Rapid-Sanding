@@ -61,5 +61,11 @@ class ConsentActivity : BaseActivity() {
         row.addView(View(this), LinearLayout.LayoutParams(dp(12), 1))
         row.addView(button("דחייה", primary = false) { ReceiverService.rejectFromUi(this, id); finish() }, LinearLayout.LayoutParams(0, WRAP, 1f))
         c.addView(row)
+        c.addView(button("קבלה תמיד מ-${info.sender}", primary = false, small = true) {
+            val prefs = Prefs(this)
+            prefs.trusted = prefs.trusted + info.sender
+            ReceiverService.acceptFromUi(this, id); finish()
+        }.apply { lp(top = 12) })
+        c.addView(text("יתווסף ל\"המכשירים שלי\" – מהם מקבלים בלי לשאול", 12f, color = Ink.GRAY).apply { lp(top = 4) })
     }
 }

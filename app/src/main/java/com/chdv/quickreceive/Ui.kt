@@ -124,6 +124,8 @@ fun Context.toggleRow(title: String, subtitle: String?, initial: Boolean, onChan
 abstract class BaseActivity : Activity() {
     lateinit var content: LinearLayout
     private lateinit var titleView: TextView
+    private var scroll: ScrollView? = null
+    private var pageKey = ""
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -134,7 +136,10 @@ abstract class BaseActivity : Activity() {
         window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
     }
 
-    fun page(title: String, back: Boolean): LinearLayout {
+    /** Builds the page. Rebuilding the same page keeps the scroll position. */
+    fun page(title: String, back: Boolean, key: String = javaClass.name): LinearLayout {
+        val keepY = if (key == pageKey) scroll?.scrollY ?: 0 else 0
+        pageKey = key
         val root = vbox().apply { setBackgroundColor(Ink.WHITE); layoutDirection = View.LAYOUT_DIRECTION_RTL }
         val bar = hbox().apply { setPadding(dp(20), dp(18), dp(20), dp(8)) }
         if (back) {
@@ -151,6 +156,8 @@ abstract class BaseActivity : Activity() {
         scroll.addView(content, FrameLayout.LayoutParams(MATCH, WRAP))
         root.addView(scroll, LinearLayout.LayoutParams(MATCH, 0, 1f))
         setContentView(root)
+        this.scroll = scroll
+        if (keepY > 0) scroll.post { scroll.scrollTo(0, keepY) }
         return content
     }
 

@@ -29,6 +29,13 @@ import kotlin.concurrent.thread
 
 /** Shared state between the service and the screens (same process). */
 object Live {
+    /** our 4-character id on the network, the same for receiving and sending */
+    val endpointId: String = run {
+        val abc = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        (1..4).map { abc[Crypto.random.nextInt(abc.length)] }.joinToString("")
+    }
+    /** the "ready to receive" screen is open: visible to everyone meanwhile */
+    @Volatile var receiveScreen = false
     @Volatile var running = false
     @Volatile var visibleAs = ""
     @Volatile var error: String? = null
@@ -51,15 +58,30 @@ class ReceiverService : Service(), Events {
     private val main = Handler(Looper.getMainLooper())
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
-    private val endpointId = randomEndpointId()
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    private val visibilityCheck = Runnable { checkVisibility() }
 
     override fun onCreate() {
         super.onCreate()
         startForeground(NOTIF_STATUS, statusNotification("מתחיל…"))
         startServer()
         watchNetwork()
+        checkVisibility()
+    }
+
+    /** Stop when nobody should see us any more (e.g. the 10 minutes are over). */
+    private fun checkVisibility() {
+        main.removeCallbacks(visibilityCheck)
+        val p = Prefs(this)
+        if (!p.visible && connections.isEmpty()) {
+            if (p.visibility == "off") p.visibility = "off"
+            stopSelf(); return
+        }
+        if (p.visibility == "temp") main.postDelayed(visibilityCheck, (p.tempUntil - System.currentTimeMillis()).coerceIn(1000, 60_000))
+        else if (!p.visible) main.postDelayed(visibilityCheck, 5_000)
+        updateStatus()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -68,9 +90,10 @@ class ReceiverService : Service(), Events {
             ACTION_ACCEPT -> accept(id)
             ACTION_REJECT -> reject(id)
             ACTION_CANCEL -> connections[id]?.cancel()
-            ACTION_REFRESH -> { unregisterNsd(); registerNsd() }
+            ACTION_REFRESH -> { unregisterNsd(); registerNsd(); checkVisibility() }
             ACTION_STOP -> {
-                Prefs(this).enabled = false
+                Prefs(this).visibility = "off"
+                Live.changed()
                 stopSelf()
             }
         }
@@ -119,7 +142,7 @@ class ReceiverService : Service(), Events {
         val port = server?.localPort ?: return
         val name = Prefs(this).deviceName
         // Service name: 0x23, 4-byte endpoint id, service id hash FC 9F 5E, two zero bytes
-        val nameBytes = byteArrayOf(0x23) + endpointId.toByteArray(Charsets.US_ASCII) +
+        val nameBytes = byteArrayOf(0x23) + Live.endpointId.toByteArray(Charsets.US_ASCII) +
             byteArrayOf(0xFC.toByte(), 0x9F.toByte(), 0x5E, 0, 0)
         val info = NsdServiceInfo().apply {
             serviceName = b64(nameBytes)
@@ -194,7 +217,8 @@ class ReceiverService : Service(), Events {
     override fun onIncoming(conn: InboundConnection, info: Incoming) {
         Live.pending[conn.id] = conn to info
         Live.changed()
-        if (Prefs(this).autoAccept) {
+        val prefs = Prefs(this)
+        if (prefs.autoAccept || info.sender in prefs.trusted) {
             accept(conn.id)
             return
         }
@@ -244,7 +268,7 @@ class ReceiverService : Service(), Events {
             entries.add(textToJson(text, info.sender))
             main.post {
                 runCatching {
-                    getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("קבלה מהירה", text))
+                    getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("שיתוף מהיר", text))
                 }
             }
         }
@@ -315,7 +339,7 @@ class ReceiverService : Service(), Events {
     private fun statusNotification(text: String): Notification =
         Notification.Builder(this, App.CH_STATUS)
             .setSmallIcon(R.drawable.ic_stat)
-            .setContentTitle("קבלה מהירה")
+            .setContentTitle("שיתוף מהיר")
             .setContentText(text)
             .setContentIntent(PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
             .addAction(Notification.Action.Builder(null, "כיבוי", serviceIntent(ACTION_STOP, 0)).build())
@@ -323,7 +347,13 @@ class ReceiverService : Service(), Events {
             .build()
 
     private fun updateStatus() {
-        val text = Live.error ?: "מוכן לקבל · גלוי בשם \"${Prefs(this).deviceName}\""
+        val p = Prefs(this)
+        val mins = ((p.tempUntil - System.currentTimeMillis()) / 60000 + 1).coerceAtLeast(1)
+        val text = Live.error ?: when {
+            Live.receiveScreen || p.visibility == "everyone" -> "גלוי לכולם בשם \"${p.deviceName}\""
+            p.visibility == "temp" -> "גלוי לכולם עוד $mins דק׳ בשם \"${p.deviceName}\""
+            else -> "לא זמין"
+        }
         getSystemService(NotificationManager::class.java).notify(NOTIF_STATUS, statusNotification(text))
     }
 
@@ -347,6 +377,12 @@ class ReceiverService : Service(), Events {
 
         fun stop(ctx: Context) = ctx.stopService(Intent(ctx, ReceiverService::class.java))
 
+        /** Start or stop receiving according to the visibility setting. */
+        fun refresh(ctx: Context) {
+            if (Prefs(ctx).visible) start(ctx, ACTION_REFRESH) else stop(ctx)
+            Live.changed()
+        }
+
         fun acceptFromUi(ctx: Context, id: Int) = ctx.startService(Intent(ctx, ReceiverService::class.java).setAction(ACTION_ACCEPT).putExtra(EXTRA_ID, id))
         fun rejectFromUi(ctx: Context, id: Int) = ctx.startService(Intent(ctx, ReceiverService::class.java).setAction(ACTION_REJECT).putExtra(EXTRA_ID, id))
 
@@ -359,10 +395,6 @@ class ReceiverService : Service(), Events {
             return byteArrayOf((2 shl 1).toByte()) + Crypto.randomBytes(16) + byteArrayOf(nameBytes.size.toByte()) + nameBytes
         }
 
-        private fun randomEndpointId(): String {
-            val abc = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-            return (1..4).map { abc[Crypto.random.nextInt(abc.length)] }.joinToString("")
-        }
 
         fun describe(info: Incoming): String = when {
             info.files.isEmpty() && info.text != null -> if (info.text.type == 2) "קישור" else "טקסט"

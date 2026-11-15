@@ -44,9 +44,25 @@ class Prefs(ctx: Context) {
             ?: (Settings.Global.getString(cr, "device_name") ?: Build.MODEL ?: "BOOX")
         set(v) = sp.edit().putString("deviceName", v).apply()
 
-    var enabled: Boolean
-        get() = sp.getBoolean("enabled", true)
-        set(v) = sp.edit().putBoolean("enabled", v).apply()
+    /** "everyone", "temp" (everyone for 10 minutes) or "off" */
+    var visibility: String
+        get() {
+            val v = sp.getString("visibility", null) ?: if (sp.getBoolean("enabled", true)) "everyone" else "off"
+            return if (v == "temp" && System.currentTimeMillis() > tempUntil) "off" else v
+        }
+        set(v) = sp.edit().putString("visibility", v).apply()
+
+    var tempUntil: Long
+        get() = sp.getLong("tempUntil", 0)
+        set(v) = sp.edit().putLong("tempUntil", v).apply()
+
+    /** Visible right now (also while the receive screen is open). */
+    val visible: Boolean get() = visibility != "off" || Live.receiveScreen
+
+    /** "My devices": incoming from these names is accepted without asking. */
+    var trusted: Set<String>
+        get() = sp.getStringSet("trusted", emptySet())!!.toSet()
+        set(v) = sp.edit().putStringSet("trusted", v).apply()
 
     var autoAccept: Boolean
         get() = sp.getBoolean("autoAccept", false)
@@ -172,6 +188,11 @@ fun storageFor(ctx: Context): Storage {
 fun savedToJson(s: Saved, sender: String) = JSONObject().apply {
     put("kind", "file"); put("name", s.name); put("size", s.size); put("uri", s.uri)
     put("mime", s.mime); put("where", s.location); put("from", sender); put("time", System.currentTimeMillis())
+}
+
+fun sentToJson(names: List<String>, to: String, size: Long) = JSONObject().apply {
+    put("kind", "sent"); put("name", if (names.size == 1) names[0] else "${names.size} קבצים"); put("to", to); put("size", size)
+    put("time", System.currentTimeMillis())
 }
 
 fun textToJson(text: String, sender: String) = JSONObject().apply {
